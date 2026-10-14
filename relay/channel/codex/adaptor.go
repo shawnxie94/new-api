@@ -5,6 +5,7 @@ import (
 	"errors"
 	"io"
 	"net/http"
+	"slices"
 	"strings"
 
 	"github.com/QuantumNous/new-api/common"
@@ -19,6 +20,64 @@ import (
 )
 
 type Adaptor struct {
+}
+
+func ensureWebSearchToolForHistory(request *dto.OpenAIResponsesRequest) error {
+	if request == nil || common.GetJsonType(request.Input) != "array" {
+		return nil
+	}
+
+	var inputItems []struct {
+		Type string `json:"type"`
+	}
+	if err := common.Unmarshal(request.Input, &inputItems); err != nil {
+		return nil
+	}
+	if !slices.ContainsFunc(inputItems, func(item struct {
+		Type string `json:"type"`
+	}) bool {
+		return strings.TrimSpace(item.Type) == "web_search_call"
+	}) {
+		return nil
+	}
+
+	var tools []json.RawMessage
+	if len(request.Tools) > 0 {
+		if err := common.Unmarshal(request.Tools, &tools); err != nil {
+			return nil
+		}
+	}
+	if slices.ContainsFunc(tools, func(tool json.RawMessage) bool {
+		var declaration struct {
+			Type string `json:"type"`
+		}
+		return common.Unmarshal(tool, &declaration) == nil && strings.HasPrefix(strings.TrimSpace(declaration.Type), "web_search")
+	}) {
+		return nil
+	}
+
+	callerDeclaredTools := len(tools) > 0
+	webSearchTool, err := common.Marshal(map[string]any{
+		"type":                "web_search",
+		"external_web_access": false,
+	})
+	if err != nil {
+		return err
+	}
+	tools = append(tools, webSearchTool)
+	request.Tools, err = common.Marshal(tools)
+	if err != nil {
+		return err
+	}
+
+	if !callerDeclaredTools {
+		var toolChoice string
+		if len(request.ToolChoice) == 0 || common.GetJsonType(request.ToolChoice) == "null" ||
+			(common.Unmarshal(request.ToolChoice, &toolChoice) == nil && (toolChoice == "" || toolChoice == "auto" || toolChoice == "none")) {
+			request.ToolChoice = json.RawMessage(`"none"`)
+		}
+	}
+	return nil
 }
 
 func (a *Adaptor) ConvertGeminiRequest(c *gin.Context, info *relaycommon.RelayInfo, request *dto.GeminiChatRequest) (any, error) {
@@ -96,6 +155,11 @@ func (a *Adaptor) ConvertOpenAIResponsesRequest(c *gin.Context, info *relaycommo
 		request.Instructions = json.RawMessage(`""`)
 	}
 
+	if !isCompact {
+		if err := ensureWebSearchToolForHistory(&request); err != nil {
+			return nil, err
+		}
+	}
 	if isCompact {
 		return request, nil
 	}

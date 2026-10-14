@@ -54,3 +54,83 @@ func TestConvertOpenAIResponsesRequestDropsPenalties(t *testing.T) {
 	assert.Nil(t, request.FrequencyPenalty)
 	assert.Nil(t, request.PresencePenalty)
 }
+
+func TestConvertOpenAIResponsesRequestDeclaresHistoricalWebSearch(t *testing.T) {
+	adaptor := &Adaptor{}
+	info := &relaycommon.RelayInfo{
+		ChannelMeta: &relaycommon.ChannelMeta{ChannelType: constant.ChannelTypeCodex},
+		RelayMode:   relayconstant.RelayModeResponses,
+	}
+	input := json.RawMessage(`[{"type":"web_search_call","status":"completed","action":{"type":"search","query":"redacted"}}]`)
+
+	converted, err := adaptor.ConvertOpenAIResponsesRequest(nil, info, dto.OpenAIResponsesRequest{
+		Model: "gpt-5-codex",
+		Input: input,
+	})
+	require.NoError(t, err)
+	request, ok := converted.(dto.OpenAIResponsesRequest)
+	require.True(t, ok)
+
+	assert.JSONEq(t, string(input), string(request.Input))
+	assert.JSONEq(t, `[{"type":"web_search","external_web_access":false}]`, string(request.Tools))
+	assert.JSONEq(t, `"none"`, string(request.ToolChoice))
+}
+
+func TestConvertOpenAIResponsesRequestKeepsExistingToolsForWebSearchHistory(t *testing.T) {
+	adaptor := &Adaptor{}
+	info := &relaycommon.RelayInfo{
+		ChannelMeta: &relaycommon.ChannelMeta{ChannelType: constant.ChannelTypeCodex},
+		RelayMode:   relayconstant.RelayModeResponses,
+	}
+
+	converted, err := adaptor.ConvertOpenAIResponsesRequest(nil, info, dto.OpenAIResponsesRequest{
+		Input:      json.RawMessage(`[{"type":"web_search_call"}]`),
+		Tools:      json.RawMessage(`[{"type":"function","name":"lookup","parameters":{"type":"object"}}]`),
+		ToolChoice: json.RawMessage(`"auto"`),
+	})
+	require.NoError(t, err)
+	request, ok := converted.(dto.OpenAIResponsesRequest)
+	require.True(t, ok)
+
+	assert.JSONEq(t, `[{"type":"function","name":"lookup","parameters":{"type":"object"}},{"type":"web_search","external_web_access":false}]`, string(request.Tools))
+	assert.JSONEq(t, `"auto"`, string(request.ToolChoice))
+}
+
+func TestConvertOpenAIResponsesRequestDoesNotDuplicateWebSearchTool(t *testing.T) {
+	adaptor := &Adaptor{}
+	info := &relaycommon.RelayInfo{
+		ChannelMeta: &relaycommon.ChannelMeta{ChannelType: constant.ChannelTypeCodex},
+		RelayMode:   relayconstant.RelayModeResponses,
+	}
+	tools := json.RawMessage(`[{"type":"web_search_preview"}]`)
+
+	converted, err := adaptor.ConvertOpenAIResponsesRequest(nil, info, dto.OpenAIResponsesRequest{
+		Input:      json.RawMessage(`[{"type":"web_search_call"}]`),
+		Tools:      tools,
+		ToolChoice: json.RawMessage(`"auto"`),
+	})
+	require.NoError(t, err)
+	request, ok := converted.(dto.OpenAIResponsesRequest)
+	require.True(t, ok)
+
+	assert.JSONEq(t, string(tools), string(request.Tools))
+	assert.JSONEq(t, `"auto"`, string(request.ToolChoice))
+}
+
+func TestConvertOpenAIResponsesCompactRequestDoesNotInjectWebSearch(t *testing.T) {
+	adaptor := &Adaptor{}
+	info := &relaycommon.RelayInfo{
+		ChannelMeta: &relaycommon.ChannelMeta{ChannelType: constant.ChannelTypeCodex},
+		RelayMode:   relayconstant.RelayModeResponsesCompact,
+	}
+
+	converted, err := adaptor.ConvertOpenAIResponsesRequest(nil, info, dto.OpenAIResponsesRequest{
+		Input: json.RawMessage(`[{"type":"web_search_call"}]`),
+	})
+	require.NoError(t, err)
+	request, ok := converted.(dto.OpenAIResponsesRequest)
+	require.True(t, ok)
+
+	assert.Empty(t, request.Tools)
+	assert.Empty(t, request.ToolChoice)
+}
