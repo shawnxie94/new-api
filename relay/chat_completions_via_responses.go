@@ -108,6 +108,15 @@ func textRequestViaResponses(c *gin.Context, info *relaycommon.RelayInfo, adapto
 	if !ok {
 		return nil, types.NewError(fmt.Errorf("expected OpenAI responses request, got %T", result.Value), types.ErrorCodeConvertRequestFailed, types.ErrOptionWithSkipRetry())
 	}
+	// Preserve Codex service tiers after the Chat-side filters/overrides. The
+	// generic converter currently omits this field, including Fast alias tiers.
+	if info.ChannelType == constant.ChannelTypeCodex && info.RelayFormat == types.RelayFormatOpenAI {
+		if chatReq, ok := request.(*dto.GeneralOpenAIRequest); ok && len(chatReq.ServiceTier) > 0 {
+			if err := common.Unmarshal(chatReq.ServiceTier, &responsesReq.ServiceTier); err != nil {
+				return nil, types.NewErrorWithStatusCode(err, types.ErrorCodeInvalidRequest, http.StatusBadRequest, types.ErrOptionWithSkipRetry())
+			}
+		}
+	}
 	return relayResponsesRequest(c, info, adaptor, responsesReq, paramOverrideApplied)
 }
 

@@ -89,9 +89,16 @@ func TestCodexChatViaResponsesSupportsBothClientModes(t *testing.T) {
 		stream      bool
 		contentType string
 		status      int
+		tier        string
+		override    bool
+		blockTier   bool
 	}{
 		{name: "codex JSON error preserved", codex: true, contentType: "application/json", status: http.StatusTooManyRequests},
 		{name: "codex buffered missing header", codex: true},
+		{name: "codex explicit tier preserved", codex: true, tier: "priority"},
+		{name: "codex disabled tier filtered", codex: true, blockTier: true},
+		{name: "codex fast alias override preserved", codex: true, tier: "priority", override: true},
+		{name: "codex ultrafast alias override preserved", codex: true, stream: true, tier: "ultrafast", override: true},
 		{name: "codex streaming missing header", codex: true, stream: true},
 		{name: "codex buffered plain text", codex: true, contentType: "text/plain"},
 		{name: "codex streaming SSE", codex: true, stream: true, contentType: "text/event-stream"},
@@ -161,10 +168,20 @@ func TestCodexChatViaResponsesSupportsBothClientModes(t *testing.T) {
 				adaptor = &codex.Adaptor{}
 				wantPath = "/backend-api/codex/responses"
 			}
+			info.ChannelOtherSettings.AllowServiceTier = !tc.blockTier
+			if tc.override {
+				info.ParamOverride = map[string]any{"service_tier": tc.tier}
+			}
 			adaptor.Init(info)
 			request := &dto.GeneralOpenAIRequest{
 				Model: "gpt-test", Stream: common.GetPointer(tc.stream),
 				Messages: []dto.Message{{Role: "user", Content: "hello"}},
+			}
+			if tc.tier != "" && !tc.override {
+				request.ServiceTier, _ = common.Marshal(tc.tier)
+			}
+			if tc.blockTier {
+				request.ServiceTier = json.RawMessage(`"priority"`)
 			}
 			usage, apiErr := textRequestViaResponses(c, info, adaptor, request)
 			if tc.status != 0 {
@@ -184,6 +201,7 @@ func TestCodexChatViaResponsesSupportsBothClientModes(t *testing.T) {
 			require.NoError(t, common.Unmarshal(<-bodies, &upstreamBody))
 			require.NotNil(t, upstreamBody.Stream)
 			assert.Equal(t, tc.codex || tc.stream, *upstreamBody.Stream)
+			assert.Equal(t, tc.tier, upstreamBody.ServiceTier)
 			assert.Equal(t, tc.stream, info.IsStream)
 			assert.Equal(t, relayconstant.RelayModeChatCompletions, info.RelayMode)
 			assert.Equal(t, "/v1/chat/completions", info.RequestURLPath)
