@@ -131,7 +131,8 @@ func relayResponsesRequest(c *gin.Context, info *relaycommon.RelayInfo, adaptor 
 		info.RelayFormat == types.RelayFormatOpenAI
 	if codexChatStream {
 		responsesReq.Stream = common.GetPointer(true)
-		info.IsStream = true
+		// IsStream remains the client mode: DoRequest uses it for SSE headers
+		// and keepalive pings, neither of which belongs in a buffered response.
 	}
 	defer func() {
 		info.RelayMode = savedRelayMode
@@ -205,6 +206,10 @@ func relayResponsesRequest(c *gin.Context, info *relaycommon.RelayInfo, adaptor 
 	}
 	if upstreamStream {
 		info.IsStream = false
+		if codexChatStream {
+			// The buffered handler copies response headers along with its JSON.
+			httpResp.Header.Set("Content-Type", "application/json")
+		}
 		usage, newApiErr := openaichannel.OaiResponsesToChatBufferedStreamHandler(c, info, httpResp)
 		if newApiErr != nil {
 			service.ResetStatusCode(newApiErr, statusCodeMappingStr)

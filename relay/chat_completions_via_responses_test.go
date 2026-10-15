@@ -205,7 +205,7 @@ func TestCodexChatViaResponsesSupportsBothClientModes(t *testing.T) {
 			assert.Equal(t, tc.stream, info.IsStream)
 			assert.Equal(t, relayconstant.RelayModeChatCompletions, info.RelayMode)
 			assert.Equal(t, "/v1/chat/completions", info.RequestURLPath)
-			if tc.codex {
+			if tc.codex && tc.stream {
 				assert.Equal(t, "text/event-stream", upstream.Header.Get("Accept"))
 			}
 			if tc.stream {
@@ -213,6 +213,7 @@ func TestCodexChatViaResponsesSupportsBothClientModes(t *testing.T) {
 				assert.Contains(t, recorder.Body.String(), `"content":"hello"`)
 				assert.Contains(t, recorder.Body.String(), "data: [DONE]")
 			} else {
+				assert.Contains(t, recorder.Header().Get("Content-Type"), "application/json")
 				var response dto.OpenAITextResponse
 				require.NoError(t, common.Unmarshal(recorder.Body.Bytes(), &response))
 				assert.Equal(t, "chat.completion", response.Object)
