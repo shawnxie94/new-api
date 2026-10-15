@@ -6,10 +6,13 @@ import (
 	"math"
 	"net/http"
 	"net/http/httptest"
+	"strings"
 	"testing"
 
 	"github.com/QuantumNous/new-api/common"
 	"github.com/QuantumNous/new-api/constant"
+	"github.com/QuantumNous/new-api/relay/channel"
+	"github.com/QuantumNous/new-api/relay/channel/codex"
 	openaichannel "github.com/QuantumNous/new-api/relay/channel/openai"
 	relaycommon "github.com/QuantumNous/new-api/relay/common"
 	relayconstant "github.com/QuantumNous/new-api/relay/constant"
@@ -73,6 +76,160 @@ func TestPrepareResponsesRequestRetainsConvertedAdaptor(t *testing.T) {
 	require.Len(t, upstreamRequest.Messages, 1)
 	assert.Equal(t, "hello", upstreamRequest.Messages[0].StringContent())
 	assert.Equal(t, []relaytypes.RelayFormat{relaytypes.RelayFormatOpenAIResponses, relaytypes.RelayFormatOpenAI}, info.RequestConversionChain)
+}
+
+func TestCodexChatViaResponsesSupportsBothClientModes(t *testing.T) {
+	oldTimeout := constant.StreamingTimeout
+	constant.StreamingTimeout = 30
+	t.Cleanup(func() { constant.StreamingTimeout = oldTimeout })
+
+	for _, tc := range []struct {
+		name        string
+		codex       bool
+		stream      bool
+		contentType string
+		status      int
+	}{
+		{name: "codex JSON error preserved", codex: true, contentType: "application/json", status: http.StatusTooManyRequests},
+		{name: "codex buffered missing header", codex: true},
+		{name: "codex streaming missing header", codex: true, stream: true},
+		{name: "codex buffered plain text", codex: true, contentType: "text/plain"},
+		{name: "codex streaming SSE", codex: true, stream: true, contentType: "text/event-stream"},
+		{name: "openai buffered JSON unchanged", contentType: "application/json"},
+		{name: "openai streaming SSE unchanged", stream: true, contentType: "text/event-stream"},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			captured := make(chan *http.Request, 1)
+			bodies := make(chan []byte, 1)
+			server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+				body, err := io.ReadAll(r.Body)
+				if err != nil {
+					http.Error(w, err.Error(), http.StatusBadRequest)
+					return
+				}
+				captured <- r
+				bodies <- body
+				w.Header()["Content-Type"] = nil // Suppress net/http content sniffing.
+				if tc.contentType != "" {
+					w.Header().Set("Content-Type", tc.contentType)
+				}
+				if tc.status != 0 {
+					w.WriteHeader(tc.status)
+					_, _ = io.WriteString(w, `{"error":{"message":"rate limited","type":"rate_limit_error","code":"rate_limit_exceeded"}}`)
+					return
+				}
+				if !tc.codex && !tc.stream {
+					_, _ = io.WriteString(w, `{"id":"resp_1","object":"response","status":"completed","model":"gpt-test","output":[{"type":"message","role":"assistant","content":[{"type":"output_text","text":"hello"}]}],"usage":{"input_tokens":2,"output_tokens":3,"total_tokens":5}}`)
+					return
+				}
+				_, _ = io.WriteString(w, strings.Join([]string{
+					`event: response.created`,
+					`data: {"type":"response.created","response":{"id":"resp_1","model":"gpt-test"}}`,
+					``,
+					`data: {"type":"response.output_text.delta","delta":"hello"}`,
+					``,
+					`data: {"type":"response.completed","response":{"id":"resp_1","model":"gpt-test","status":"completed","output":[{"type":"message","role":"assistant","content":[{"type":"output_text","text":"hello"}]}],"usage":{"input_tokens":2,"output_tokens":3,"total_tokens":5}}}`,
+					``, ``,
+				}, "\n"))
+			}))
+			defer server.Close()
+
+			recorder := httptest.NewRecorder()
+			c, _ := gin.CreateTestContext(recorder)
+			c.Request = httptest.NewRequest(http.MethodPost, "/v1/chat/completions", nil)
+			info := &relaycommon.RelayInfo{
+				RelayMode:              relayconstant.RelayModeChatCompletions,
+				RequestURLPath:         "/v1/chat/completions",
+				RelayFormat:            relaytypes.RelayFormatOpenAI,
+				IsStream:               tc.stream,
+				DisablePing:            true,
+				ShouldIncludeUsage:     true,
+				OriginModelName:        "gpt-test",
+				RequestConversionChain: []relaytypes.RelayFormat{relaytypes.RelayFormatOpenAI},
+				ChannelMeta: &relaycommon.ChannelMeta{
+					ChannelType:       constant.ChannelTypeOpenAI,
+					ChannelBaseUrl:    server.URL,
+					ApiKey:            "test-key",
+					UpstreamModelName: "gpt-test",
+				},
+			}
+			var adaptor channel.Adaptor = &openaichannel.Adaptor{}
+			wantPath := "/v1/responses"
+			if tc.codex {
+				info.ChannelType = constant.ChannelTypeCodex
+				info.ApiKey = `{"access_token":"test-token","account_id":"test-account"}`
+				adaptor = &codex.Adaptor{}
+				wantPath = "/backend-api/codex/responses"
+			}
+			adaptor.Init(info)
+			request := &dto.GeneralOpenAIRequest{
+				Model: "gpt-test", Stream: common.GetPointer(tc.stream),
+				Messages: []dto.Message{{Role: "user", Content: "hello"}},
+			}
+			usage, apiErr := textRequestViaResponses(c, info, adaptor, request)
+			if tc.status != 0 {
+				require.NotNil(t, apiErr)
+				assert.Equal(t, tc.status, apiErr.StatusCode)
+				assert.Contains(t, apiErr.Error(), "rate limited")
+				assert.Equal(t, tc.stream, info.IsStream)
+				assert.Equal(t, relayconstant.RelayModeChatCompletions, info.RelayMode)
+				return
+			}
+			require.Nil(t, apiErr)
+			require.NotNil(t, usage)
+			assert.Equal(t, 5, usage.TotalTokens)
+			upstream := <-captured
+			assert.Equal(t, wantPath, upstream.URL.Path)
+			var upstreamBody dto.OpenAIResponsesRequest
+			require.NoError(t, common.Unmarshal(<-bodies, &upstreamBody))
+			require.NotNil(t, upstreamBody.Stream)
+			assert.Equal(t, tc.codex || tc.stream, *upstreamBody.Stream)
+			assert.Equal(t, tc.stream, info.IsStream)
+			assert.Equal(t, relayconstant.RelayModeChatCompletions, info.RelayMode)
+			assert.Equal(t, "/v1/chat/completions", info.RequestURLPath)
+			if tc.codex {
+				assert.Equal(t, "text/event-stream", upstream.Header.Get("Accept"))
+			}
+			if tc.stream {
+				assert.Contains(t, recorder.Header().Get("Content-Type"), "text/event-stream")
+				assert.Contains(t, recorder.Body.String(), `"content":"hello"`)
+				assert.Contains(t, recorder.Body.String(), "data: [DONE]")
+			} else {
+				var response dto.OpenAITextResponse
+				require.NoError(t, common.Unmarshal(recorder.Body.Bytes(), &response))
+				assert.Equal(t, "chat.completion", response.Object)
+				require.Len(t, response.Choices, 1)
+				assert.Equal(t, "hello", response.Choices[0].Message.StringContent())
+			}
+		})
+	}
+}
+
+func TestPrepareNativeCodexResponsesStreamUnchanged(t *testing.T) {
+	for _, stream := range []bool{false, true} {
+		c, _ := gin.CreateTestContext(httptest.NewRecorder())
+		c.Request = httptest.NewRequest(http.MethodPost, "/v1/responses", nil)
+		common.SetContextKey(c, constant.ContextKeyOriginalModel, "gpt-test")
+		common.SetContextKey(c, constant.ContextKeyChannelType, constant.ChannelTypeCodex)
+		common.SetContextKey(c, constant.ContextKeyChannelBaseUrl, "http://codex.test")
+		common.SetContextKey(c, constant.ContextKeyChannelKey, `{"access_token":"test-token","account_id":"test-account"}`)
+		request := &dto.OpenAIResponsesRequest{
+			Model: "gpt-test", Stream: common.GetPointer(stream),
+			Input: []byte(`[{"role":"user","content":"hello"}]`),
+		}
+		info := relaycommon.GenRelayInfoResponses(c, request)
+		_, body, closer, apiErr := PrepareResponsesRequest(c, info, request)
+		require.Nil(t, apiErr)
+		data, err := io.ReadAll(body)
+		require.NoError(t, err)
+		require.NoError(t, closer.Close())
+		var upstream dto.OpenAIResponsesRequest
+		require.NoError(t, common.Unmarshal(data, &upstream))
+		require.NotNil(t, upstream.Stream)
+		assert.Equal(t, stream, *upstream.Stream)
+		assert.Equal(t, stream, *request.Stream)
+		assert.JSONEq(t, string(request.Input), string(upstream.Input))
+	}
 }
 
 func TestIsResponsesEventStreamContentType(t *testing.T) {

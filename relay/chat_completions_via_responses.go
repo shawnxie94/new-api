@@ -114,9 +114,22 @@ func textRequestViaResponses(c *gin.Context, info *relaycommon.RelayInfo, adapto
 func relayResponsesRequest(c *gin.Context, info *relaycommon.RelayInfo, adaptor channel.Adaptor, responsesReq *dto.OpenAIResponsesRequest, paramOverrideApplied bool) (*dto.Usage, *types.NewAPIError) {
 	savedRelayMode := info.RelayMode
 	savedRequestURLPath := info.RequestURLPath
+	clientStream := info.IsStream
+	// Codex only accepts SSE upstream. Keep this transport requirement local to
+	// Chat conversion; native Responses requests retain their existing behavior.
+	codexChatStream := info.ChannelType == constant.ChannelTypeCodex &&
+		savedRelayMode == relayconstant.RelayModeChatCompletions &&
+		info.RelayFormat == types.RelayFormatOpenAI
+	if codexChatStream {
+		responsesReq.Stream = common.GetPointer(true)
+		info.IsStream = true
+	}
 	defer func() {
 		info.RelayMode = savedRelayMode
 		info.RequestURLPath = savedRequestURLPath
+		if codexChatStream {
+			info.IsStream = clientStream
+		}
 	}()
 
 	info.RelayMode = relayconstant.RelayModeResponses
@@ -164,8 +177,8 @@ func relayResponsesRequest(c *gin.Context, info *relaycommon.RelayInfo, adaptor 
 	statusCodeMappingStr := c.GetString("status_code_mapping")
 
 	httpResp = resp.(*http.Response)
-	clientStream := info.IsStream
-	upstreamStream := isResponsesEventStreamContentType(httpResp.Header.Get("Content-Type"))
+	// Codex may omit Content-Type even for successful SSE responses.
+	upstreamStream := codexChatStream || isResponsesEventStreamContentType(httpResp.Header.Get("Content-Type"))
 	info.IsStream = clientStream || upstreamStream
 	if httpResp.StatusCode != http.StatusOK {
 		newApiErr := service.RelayErrorHandler(c.Request.Context(), httpResp, false)
