@@ -108,12 +108,16 @@ func textRequestViaResponses(c *gin.Context, info *relaycommon.RelayInfo, adapto
 	if !ok {
 		return nil, types.NewError(fmt.Errorf("expected OpenAI responses request, got %T", result.Value), types.ErrorCodeConvertRequestFailed, types.ErrOptionWithSkipRetry())
 	}
-	// Preserve Codex service tiers after the Chat-side filters/overrides. The
-	// generic converter currently omits this field, including Fast alias tiers.
+	// Preserve Codex fields omitted by the generic converter after Chat-side
+	// filters/overrides. Retention must reach upstream validation, not silently
+	// disappear: Codex currently rejects it, unlike the regular OpenAI API.
 	if info.ChannelType == constant.ChannelTypeCodex && info.RelayFormat == types.RelayFormatOpenAI {
-		if chatReq, ok := request.(*dto.GeneralOpenAIRequest); ok && len(chatReq.ServiceTier) > 0 {
-			if err := common.Unmarshal(chatReq.ServiceTier, &responsesReq.ServiceTier); err != nil {
-				return nil, types.NewErrorWithStatusCode(err, types.ErrorCodeInvalidRequest, http.StatusBadRequest, types.ErrOptionWithSkipRetry())
+		if chatReq, ok := request.(*dto.GeneralOpenAIRequest); ok {
+			responsesReq.PromptCacheRetention = chatReq.PromptCacheRetention
+			if len(chatReq.ServiceTier) > 0 {
+				if err := common.Unmarshal(chatReq.ServiceTier, &responsesReq.ServiceTier); err != nil {
+					return nil, types.NewErrorWithStatusCode(err, types.ErrorCodeInvalidRequest, http.StatusBadRequest, types.ErrOptionWithSkipRetry())
+				}
 			}
 		}
 	}

@@ -92,9 +92,13 @@ func TestCodexChatViaResponsesSupportsBothClientModes(t *testing.T) {
 		tier        string
 		override    bool
 		blockTier   bool
+		retention   string
 	}{
 		{name: "codex JSON error preserved", codex: true, contentType: "application/json", status: http.StatusTooManyRequests},
 		{name: "codex buffered missing header", codex: true},
+		{name: "codex retention forwarded buffered", codex: true, retention: "24h"},
+		{name: "codex retention forwarded streaming", codex: true, stream: true, retention: "in_memory"},
+		{name: "codex unsupported retention preserved", codex: true, retention: "24h", status: http.StatusBadRequest, contentType: "application/json"},
 		{name: "codex explicit tier preserved", codex: true, tier: "priority"},
 		{name: "codex disabled tier filtered", codex: true, blockTier: true},
 		{name: "codex fast alias override preserved", codex: true, tier: "priority", override: true},
@@ -122,11 +126,15 @@ func TestCodexChatViaResponsesSupportsBothClientModes(t *testing.T) {
 				}
 				if tc.status != 0 {
 					w.WriteHeader(tc.status)
-					_, _ = io.WriteString(w, `{"error":{"message":"rate limited","type":"rate_limit_error","code":"rate_limit_exceeded"}}`)
+					if tc.status == http.StatusBadRequest {
+						_, _ = io.WriteString(w, `{"error":{"message":"Unsupported parameter: prompt_cache_retention","type":"invalid_request_error","code":"invalid_parameter"}}`)
+					} else {
+						_, _ = io.WriteString(w, `{"error":{"message":"rate limited","type":"rate_limit_error","code":"rate_limit_exceeded"}}`)
+					}
 					return
 				}
 				if !tc.codex && !tc.stream {
-					_, _ = io.WriteString(w, `{"id":"resp_1","object":"response","status":"completed","model":"gpt-test","output":[{"type":"message","role":"assistant","content":[{"type":"output_text","text":"hello"}]}],"usage":{"input_tokens":2,"output_tokens":3,"total_tokens":5}}`)
+					_, _ = io.WriteString(w, `{"id":"resp_1","object":"response","status":"completed","model":"gpt-test","output":[{"type":"message","role":"assistant","content":[{"type":"output_text","text":"hello"}]}],"usage":{"input_tokens":2,"input_tokens_details":{"cached_tokens":1},"output_tokens":3,"total_tokens":5}}`)
 					return
 				}
 				_, _ = io.WriteString(w, strings.Join([]string{
@@ -135,7 +143,7 @@ func TestCodexChatViaResponsesSupportsBothClientModes(t *testing.T) {
 					``,
 					`data: {"type":"response.output_text.delta","delta":"hello"}`,
 					``,
-					`data: {"type":"response.completed","response":{"id":"resp_1","model":"gpt-test","status":"completed","output":[{"type":"message","role":"assistant","content":[{"type":"output_text","text":"hello"}]}],"usage":{"input_tokens":2,"output_tokens":3,"total_tokens":5}}}`,
+					`data: {"type":"response.completed","response":{"id":"resp_1","model":"gpt-test","status":"completed","output":[{"type":"message","role":"assistant","content":[{"type":"output_text","text":"hello"}]}],"usage":{"input_tokens":2,"input_tokens_details":{"cached_tokens":1},"output_tokens":3,"total_tokens":5}}}`,
 					``, ``,
 				}, "\n"))
 			}))
@@ -175,7 +183,11 @@ func TestCodexChatViaResponsesSupportsBothClientModes(t *testing.T) {
 			adaptor.Init(info)
 			request := &dto.GeneralOpenAIRequest{
 				Model: "gpt-test", Stream: common.GetPointer(tc.stream),
-				Messages: []dto.Message{{Role: "user", Content: "hello"}},
+				Messages:       []dto.Message{{Role: "user", Content: "hello"}},
+				PromptCacheKey: "cache-accept-test",
+			}
+			if tc.retention != "" {
+				request.PromptCacheRetention, _ = common.Marshal(tc.retention)
 			}
 			if tc.tier != "" && !tc.override {
 				request.ServiceTier, _ = common.Marshal(tc.tier)
@@ -184,10 +196,20 @@ func TestCodexChatViaResponsesSupportsBothClientModes(t *testing.T) {
 				request.ServiceTier = json.RawMessage(`"priority"`)
 			}
 			usage, apiErr := textRequestViaResponses(c, info, adaptor, request)
+			upstream := <-captured
+			assert.Equal(t, wantPath, upstream.URL.Path)
+			var upstreamBody dto.OpenAIResponsesRequest
+			require.NoError(t, common.Unmarshal(<-bodies, &upstreamBody))
+			assert.JSONEq(t, `"cache-accept-test"`, string(upstreamBody.PromptCacheKey))
+			assert.Equal(t, request.PromptCacheRetention, upstreamBody.PromptCacheRetention)
 			if tc.status != 0 {
 				require.NotNil(t, apiErr)
 				assert.Equal(t, tc.status, apiErr.StatusCode)
-				assert.Contains(t, apiErr.Error(), "rate limited")
+				if tc.status == http.StatusBadRequest {
+					assert.Contains(t, apiErr.Error(), "Unsupported parameter: prompt_cache_retention")
+				} else {
+					assert.Contains(t, apiErr.Error(), "rate limited")
+				}
 				assert.Equal(t, tc.stream, info.IsStream)
 				assert.Equal(t, relayconstant.RelayModeChatCompletions, info.RelayMode)
 				return
@@ -195,10 +217,7 @@ func TestCodexChatViaResponsesSupportsBothClientModes(t *testing.T) {
 			require.Nil(t, apiErr)
 			require.NotNil(t, usage)
 			assert.Equal(t, 5, usage.TotalTokens)
-			upstream := <-captured
-			assert.Equal(t, wantPath, upstream.URL.Path)
-			var upstreamBody dto.OpenAIResponsesRequest
-			require.NoError(t, common.Unmarshal(<-bodies, &upstreamBody))
+			assert.Equal(t, 1, usage.PromptTokensDetails.CachedTokens)
 			require.NotNil(t, upstreamBody.Stream)
 			assert.Equal(t, tc.codex || tc.stream, *upstreamBody.Stream)
 			assert.Equal(t, tc.tier, upstreamBody.ServiceTier)
@@ -212,11 +231,13 @@ func TestCodexChatViaResponsesSupportsBothClientModes(t *testing.T) {
 				assert.Contains(t, recorder.Header().Get("Content-Type"), "text/event-stream")
 				assert.Contains(t, recorder.Body.String(), `"content":"hello"`)
 				assert.Contains(t, recorder.Body.String(), "data: [DONE]")
+				assert.Contains(t, recorder.Body.String(), `"prompt_tokens_details":{"cached_tokens":1`)
 			} else {
 				assert.Contains(t, recorder.Header().Get("Content-Type"), "application/json")
 				var response dto.OpenAITextResponse
 				require.NoError(t, common.Unmarshal(recorder.Body.Bytes(), &response))
 				assert.Equal(t, "chat.completion", response.Object)
+				assert.Equal(t, 1, response.Usage.PromptTokensDetails.CachedTokens)
 				require.Len(t, response.Choices, 1)
 				assert.Equal(t, "hello", response.Choices[0].Message.StringContent())
 			}
@@ -234,7 +255,9 @@ func TestPrepareNativeCodexResponsesStreamUnchanged(t *testing.T) {
 		common.SetContextKey(c, constant.ContextKeyChannelKey, `{"access_token":"test-token","account_id":"test-account"}`)
 		request := &dto.OpenAIResponsesRequest{
 			Model: "gpt-test", Stream: common.GetPointer(stream),
-			Input: []byte(`[{"role":"user","content":"hello"}]`),
+			Input:                []byte(`[{"role":"user","content":"hello"}]`),
+			PromptCacheKey:       json.RawMessage(`"native-cache-key"`),
+			PromptCacheRetention: json.RawMessage(`"24h"`),
 		}
 		info := relaycommon.GenRelayInfoResponses(c, request)
 		_, body, closer, apiErr := PrepareResponsesRequest(c, info, request)
@@ -248,6 +271,8 @@ func TestPrepareNativeCodexResponsesStreamUnchanged(t *testing.T) {
 		assert.Equal(t, stream, *upstream.Stream)
 		assert.Equal(t, stream, *request.Stream)
 		assert.JSONEq(t, string(request.Input), string(upstream.Input))
+		assert.Equal(t, request.PromptCacheKey, upstream.PromptCacheKey)
+		assert.Equal(t, request.PromptCacheRetention, upstream.PromptCacheRetention)
 	}
 }
 
